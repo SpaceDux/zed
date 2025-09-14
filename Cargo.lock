@@ -5052,6 +5052,7 @@ dependencies = [
  "aho-corasick",
  "anyhow",
  "assets",
+ "bincode",
  "buffer_diff",
  "client",
  "clock",

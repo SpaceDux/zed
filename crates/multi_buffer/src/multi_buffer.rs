@@ -54,6 +54,26 @@ use util::post_inc;
 
 const NEWLINES: &[u8] = &[b'\n'; u8::MAX as usize];
 
+/// Serializable version of History for persistence
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct SerializableHistory {
+    pub undo_stack: Vec<SerializableTransaction>,
+    pub redo_stack: Vec<SerializableTransaction>,
+    pub next_transaction_id: u64,
+    pub transaction_depth: usize,
+    pub group_interval_ms: u64,
+}
+
+/// Serializable version of Transaction for persistence
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct SerializableTransaction {
+    pub id: u64,
+    pub buffer_transactions: Vec<(u64, u64)>, // (BufferId, TransactionId)
+    pub first_edit_at: u64,                   // timestamp as millis since epoch
+    pub last_edit_at: u64,                    // timestamp as millis since epoch
+    pub suppress_grouping: bool,
+}
+
 #[derive(Debug, Default, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ExcerptId(usize);
 
@@ -726,6 +746,106 @@ impl MultiBuffer {
     pub fn read(&self, cx: &App) -> Ref<'_, MultiBufferSnapshot> {
         self.sync(cx);
         self.snapshot.borrow()
+    }
+
+    pub fn get_serializable_history(&self) -> SerializableHistory {
+        SerializableHistory {
+            undo_stack: self
+                .history
+                .undo_stack
+                .iter()
+                .map(|tx| SerializableTransaction {
+                    id: tx.id.as_u64(),
+                    buffer_transactions: tx
+                        .buffer_transactions
+                        .iter()
+                        .map(|(buf_id, tx_id)| (u64::from(*buf_id), tx_id.as_u64()))
+                        .collect(),
+                    first_edit_at: tx.first_edit_at.elapsed().as_millis() as u64,
+                    last_edit_at: tx.last_edit_at.elapsed().as_millis() as u64,
+                    suppress_grouping: tx.suppress_grouping,
+                })
+                .collect(),
+            redo_stack: self
+                .history
+                .redo_stack
+                .iter()
+                .map(|tx| SerializableTransaction {
+                    id: tx.id.as_u64(),
+                    buffer_transactions: tx
+                        .buffer_transactions
+                        .iter()
+                        .map(|(buf_id, tx_id)| (u64::from(*buf_id), tx_id.as_u64()))
+                        .collect(),
+                    first_edit_at: tx.first_edit_at.elapsed().as_millis() as u64,
+                    last_edit_at: tx.last_edit_at.elapsed().as_millis() as u64,
+                    suppress_grouping: tx.suppress_grouping,
+                })
+                .collect(),
+            next_transaction_id: self.history.next_transaction_id.as_u64(),
+            transaction_depth: self.history.transaction_depth,
+            group_interval_ms: self.history.group_interval.as_millis() as u64,
+        }
+    }
+
+    pub fn set_history(&mut self, serializable_history: SerializableHistory) {
+        // Helper function to reconstruct Lamport timestamp from u64
+        fn lamport_from_u64(value: u64) -> TransactionId {
+            let replica_id = (value & 0xFFFFFFFF) as u16;
+            let seq = (value >> 32) as u32;
+            TransactionId {
+                replica_id,
+                value: seq,
+            }
+        }
+
+        self.history.undo_stack = serializable_history
+            .undo_stack
+            .into_iter()
+            .map(|tx| Transaction {
+                id: lamport_from_u64(tx.id),
+                buffer_transactions: tx
+                    .buffer_transactions
+                    .into_iter()
+                    .map(|(buf_id, tx_id)| {
+                        let buffer_id =
+                            BufferId::new(buf_id).unwrap_or_else(|_| BufferId::new(1).unwrap());
+                        let transaction_id = lamport_from_u64(tx_id);
+                        (buffer_id, transaction_id)
+                    })
+                    .collect(),
+                first_edit_at: Instant::now(),
+                last_edit_at: Instant::now(),
+                suppress_grouping: tx.suppress_grouping,
+            })
+            .collect();
+
+        self.history.redo_stack = serializable_history
+            .redo_stack
+            .into_iter()
+            .map(|tx| Transaction {
+                id: lamport_from_u64(tx.id),
+                buffer_transactions: tx
+                    .buffer_transactions
+                    .into_iter()
+                    .map(|(buf_id, tx_id)| {
+                        let buffer_id =
+                            BufferId::new(buf_id).unwrap_or_else(|_| BufferId::new(1).unwrap());
+                        let transaction_id = lamport_from_u64(tx_id);
+                        (buffer_id, transaction_id)
+                    })
+                    .collect(),
+                first_edit_at: Instant::now(),
+                last_edit_at: Instant::now(),
+                suppress_grouping: tx.suppress_grouping,
+            })
+            .collect();
+
+        self.history.next_transaction_id =
+            lamport_from_u64(serializable_history.next_transaction_id);
+        self.history.transaction_depth = serializable_history.transaction_depth;
+        self.history.group_interval =
+            std::time::Duration::from_millis(serializable_history.group_interval_ms);
     }
 
     pub fn as_singleton(&self) -> Option<Entity<Buffer>> {

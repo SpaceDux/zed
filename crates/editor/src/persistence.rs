@@ -10,6 +10,7 @@ use db::{
 };
 use fs::MTime;
 use itertools::Itertools as _;
+use multi_buffer::{MultiBuffer, SerializableHistory};
 use std::path::PathBuf;
 
 use workspace::{ItemId, WorkspaceDb, WorkspaceId};
@@ -197,6 +198,17 @@ impl Domain for EditorDb {
                 ON DELETE CASCADE
             ) STRICT;
         ),
+        // persist editor buffer
+        sql! (
+            CREATE TABLE editor_history (
+                item_id INTEGER NOT NULL,
+                workspace_id INTEGER NOT NULL,
+                history_data BLOB NOT NULL,
+                PRIMARY KEY(item_id, workspace_id),
+                FOREIGN KEY(item_id, workspace_id) REFERENCES editors(item_id, workspace_id)
+                ON DELETE CASCADE
+            ) STRICT;
+        ),
     ];
 }
 
@@ -278,6 +290,17 @@ impl EditorDb {
             SELECT start, end
             FROM editor_folds
             WHERE editor_id = ?1 AND workspace_id = ?2
+        }
+    }
+
+    query! {
+        pub fn get_editor_history(
+            item_id: ItemId,
+            workspace_id: WorkspaceId
+        ) -> Result<Option<Vec<u8>>> {
+            SELECT history_data
+            FROM editor_history
+            WHERE item_id = ?1 AND workspace_id = ?2
         }
     }
 
@@ -384,6 +407,78 @@ VALUES {placeholders};
         }
         Ok(())
     }
+
+    pub async fn save_editor_history(
+        &self,
+        item_id: ItemId,
+        workspace_id: WorkspaceId,
+        editor_history: &MultiBuffer,
+    ) -> Result<()> {
+        log::debug!(
+            "Saving serialized editor history for editor {item_id} in workspace {workspace_id:?}"
+        );
+
+        // Get the serializable history from the multi-buffer
+        let serializable_history = editor_history.get_serializable_history();
+
+        // Serialize the history
+        let serialized_data = bincode::serialize(&serializable_history)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize history: {}", e))?;
+
+        // Save serialized history
+        self.save_serialized_editor_history(item_id, workspace_id, serialized_data)
+            .await?;
+
+        Ok(())
+    }
+
+    pub fn get_serialized_editor_history(
+        &self,
+        item_id: ItemId,
+        workspace_id: WorkspaceId,
+    ) -> Result<Option<SerializableHistory>> {
+        log::debug!("Fetching editor buffer history for {item_id} in workspace {workspace_id:?}");
+
+        // Query to get the serialized history using the query! macro
+        let serialized_data = match DB.get_editor_history(item_id, workspace_id)? {
+            Some(data) => Some(data),
+            None => None,
+        };
+
+        if let Some(serialized_data) = serialized_data {
+            let history = bincode::deserialize::<SerializableHistory>(serialized_data.as_slice())
+                .map_err(|e| anyhow::anyhow!("Failed to deserialize history: {}", e))?;
+            Ok(Some(history))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub async fn save_serialized_editor_history(
+        &self,
+        editor_id: ItemId,
+        workspace_id: WorkspaceId,
+        serialized_buffer: Vec<u8>,
+    ) -> Result<()> {
+        log::debug!(
+            "Saving serializeds editor history for {editor_id} in workspace {workspace_id:?}"
+        );
+
+        self.write(move |conn| {
+            let mut statement = Statement::prepare(
+                conn,
+                "INSERT INTO editor_history (item_id, workspace_id, history_data)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT (item_id, workspace_id) DO UPDATE SET history_data = EXCLUDED.history_data"
+            )?;
+            statement.bind(&editor_id, 1)?;
+            statement.bind(&workspace_id, 2)?;
+            statement.bind(&serialized_buffer, 3)?;
+            statement.exec()
+        }).await?;
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -464,5 +559,46 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(have, serialized_editor);
+    }
+
+    #[gpui::test]
+    async fn test_editor_history_persistence() {
+        use language::Capability;
+        use multi_buffer::MultiBuffer;
+
+        let workspace_id = workspace::WORKSPACE_DB.next_id().await.unwrap();
+        let item_id = 5678;
+
+        // First create an editor record (required by foreign key constraint)
+        let serialized_editor = SerializedEditor {
+            abs_path: Some(std::path::PathBuf::from("test.txt")),
+            contents: None,
+            language: None,
+            mtime: None,
+        };
+
+        DB.save_serialized_editor(item_id, workspace_id, serialized_editor)
+            .await
+            .unwrap();
+
+        // Create a multi-buffer with some mock history
+        let buffer = MultiBuffer::new(Capability::ReadWrite);
+
+        // Test saving empty history
+        DB.save_editor_history(item_id, workspace_id, &buffer)
+            .await
+            .unwrap();
+
+        // Test retrieving the history
+        let retrieved_history = DB
+            .get_serialized_editor_history(item_id, workspace_id)
+            .unwrap();
+        assert!(retrieved_history.is_some());
+
+        let history = retrieved_history.unwrap();
+        assert_eq!(history.undo_stack.len(), 0);
+        assert_eq!(history.redo_stack.len(), 0);
+        assert_eq!(history.transaction_depth, 0);
+        assert_eq!(history.group_interval_ms, 300);
     }
 }

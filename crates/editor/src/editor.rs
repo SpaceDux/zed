@@ -21597,6 +21597,28 @@ impl Editor {
         self.load_diff_task.clone()
     }
 
+    pub fn restore_editor_history(
+        &self,
+        item_id: ItemId,
+        workspace_id: WorkspaceId,
+        cx: &mut Context<Self>,
+    ) -> Result<bool> {
+        log::debug!("Restoring buffer history for {item_id} in workspace {workspace_id:?}");
+
+        if let Some(serializable_history) =
+            DB.get_serialized_editor_history(item_id, workspace_id)?
+        {
+            self.buffer.update(cx, |buffer, _| {
+                buffer.set_history(serializable_history);
+            });
+            log::debug!("Successfully restored buffer history for {item_id}");
+            Ok(true)
+        } else {
+            log::debug!("No persisted history found for {item_id}");
+            Ok(false)
+        }
+    }
+
     fn read_metadata_from_db(
         &mut self,
         item_id: u64,
@@ -21645,6 +21667,9 @@ impl Editor {
         }
 
         self.read_scroll_position_from_db(item_id, workspace_id, window, cx);
+        if let Err(e) = self.restore_editor_history(item_id, workspace_id, cx) {
+            log::warn!("Failed to restore editor history: {}", e);
+        }
     }
 
     fn update_lsp_data(
