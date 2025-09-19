@@ -21619,6 +21619,28 @@ impl Editor {
         }
     }
 
+    pub fn save_editor_history(
+        &self,
+        item_id: ItemId,
+        workspace_id: WorkspaceId,
+        cx: &mut Context<Editor>,
+    ) {
+        let buffer = self.buffer.clone();
+        cx.spawn(async move |_handle, cx| {
+            if let Ok(result) = buffer
+                .read_with(&cx, |buffer, _cx| {
+                    DB.save_editor_history(item_id, workspace_id, buffer)
+                })
+                .await
+            {
+                if let Err(error) = result.await {
+                    log::error!("Failed to save editor history: {}", error);
+                }
+            }
+        })
+        .detach();
+    }
+
     fn read_metadata_from_db(
         &mut self,
         item_id: u64,
